@@ -1,0 +1,7 @@
+{
+  "_comment": "Скопируй этот файл в config.json и заполни своими данными",
+  "vk_token": "YOUR_VK_BOT_TOKEN_HERE",
+  "admin_ids": [123456789],
+  "parse_interval_minutes": 30,
+  "_vk_token_note": "Получи токен: https://dev.vk.com/ → Создать приложение → Standalone → Получить токен"
+}
