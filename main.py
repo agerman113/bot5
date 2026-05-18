@@ -124,7 +124,7 @@ class VKYouTubeReposter:
     def download_video(self, url, path="temp_video.mp4"):
         opts = {
             "outtmpl": path,
-            "format": "best[ext=mp4]/best[ext=webm]/best",
+            "format": "best/bestvideo*",
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 120,
@@ -216,8 +216,9 @@ class VKYouTubeReposter:
             logging.error(f"Ошибка обработки {url}: {ex}")
             return False
         finally:
-            if os.path.exists("temp_video.mp4"):
-                os.remove("temp_video.mp4")
+            for f in ["temp_video.mp4", "temp_video.webm"]:
+                if os.path.exists(f):
+                    os.remove(f)
 
     def run_forever(self):
         if not self.channel_ids:
@@ -245,14 +246,23 @@ class VKYouTubeReposter:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    bot = VKYouTubeReposter()
+    try:
+        bot = VKYouTubeReposter()
+    except Exception as e:
+        logging.critical(f"Ошибка инициализации: {e}")
+        sys.exit(1)
 
-    # Режим 1: FORCE_UPLOAD_URL в .env → залить и выйти
+    # Режим 1: FORCE_UPLOAD_URL → залить и выйти (Railway не будет перезапускать при exit(0))
     force_url = os.getenv("FORCE_UPLOAD_URL", "").strip()
     if force_url:
         logging.info(f"=== РУЧНАЯ ЗАЛИВКА: {force_url} ===")
         ok = bot.process(force_url)
-        sys.exit(0 if ok else 1)
+        if ok:
+            logging.info("Заливка завершена успешно. Очисти FORCE_UPLOAD_URL и задеплой снова.")
+        else:
+            logging.error("Заливка не удалась. Проверь логи выше.")
+        # Выходим с кодом 0 в любом случае — чтобы Railway не перезапускал в цикле
+        sys.exit(0)
 
     # Режим 2: аргумент командной строки → python main.py https://...
     if len(sys.argv) == 2 and sys.argv[1].startswith("http"):
