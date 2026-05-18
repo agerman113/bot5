@@ -272,6 +272,24 @@ class VKYouTubeReposter:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Диагностический режим — выводит форматы и выходит
+    debug_url = os.getenv("DEBUG_URL", "").strip()
+    if debug_url:
+        cookies_content = os.getenv("YT_COOKIES", "").strip()
+        cookies_file = None
+        if cookies_content:
+            cookies_file = "/tmp/yt_cookies.txt"
+            open(cookies_file, "w").write(cookies_content)
+        opts = {"quiet": False, "no_warnings": False, "listformats": True}
+        if cookies_file:
+            opts["cookiefile"] = cookies_file
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                ydl.extract_info(debug_url, download=False)
+            except Exception as e:
+                print(f"Ошибка: {e}")
+        sys.exit(0)
+
     try:
         bot = VKYouTubeReposter()
     except Exception as e:
