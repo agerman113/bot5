@@ -103,7 +103,6 @@ class VKYouTubeReposter:
         opts = {
             "quiet": True,
             "no_warnings": True,
-            "skip_download": True,
         }
         if self.cookies_file:
             opts["cookiefile"] = self.cookies_file
@@ -133,15 +132,21 @@ class VKYouTubeReposter:
     def download_video(self, url, info, path="temp_video.mp4"):
         """Скачивает видео. info передаётся чтобы не делать повторный запрос к YT."""
         # Выбираем лучший одиночный поток (без склейки — нет ffmpeg)
-        # Берём формат с наибольшим tbr среди тех, что содержат и видео и аудио
+        formats = info.get("formats", [])
+        logging.info(f"Доступные форматы ({len(formats)} шт): " +
+            ", ".join(f"{f.get('format_id')}({f.get('ext')},v={f.get('vcodec','?')[:4]},a={f.get('acodec','?')[:4]})" for f in formats))
+
         best_fmt = None
-        for fmt in sorted(info.get("formats", []), key=lambda f: f.get("tbr") or 0, reverse=True):
+        for fmt in sorted(formats, key=lambda f: f.get("tbr") or 0, reverse=True):
             vcodec = fmt.get("vcodec", "none")
             acodec = fmt.get("acodec", "none")
-            if vcodec != "none" and acodec != "none":
+            if vcodec not in (None, "none") and acodec not in (None, "none"):
                 best_fmt = fmt["format_id"]
                 logging.info(f"Выбран формат: {fmt.get('format_id')} {fmt.get('ext')} {fmt.get('width')}x{fmt.get('height')} tbr={fmt.get('tbr')}")
                 break
+
+        if not best_fmt:
+            logging.warning("Не найден формат с видео+аудио, пробуем 'best'")
 
         opts = {
             "outtmpl": path,
