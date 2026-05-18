@@ -39,6 +39,26 @@ class VKYouTubeReposter:
             api_key=os.getenv("OPENROUTER_API_KEY")
         )
         self.processed = self._load_processed()
+        self.cookies_file = self._prepare_cookies()
+
+    # ── Cookies ──────────────────────────────────────────────────────────────
+
+    def _prepare_cookies(self):
+        """Создаёт cookies.txt из переменной окружения YT_COOKIES если задана."""
+        cookies_content = os.getenv("YT_COOKIES", "").strip()
+        if cookies_content:
+            path = "/tmp/yt_cookies.txt"
+            with open(path, "w") as f:
+                f.write(cookies_content)
+            logging.info("Куки YouTube загружены из переменной YT_COOKIES")
+            return path
+        # Проверяем наличие файла рядом со скриптом
+        local = os.path.join(os.path.dirname(__file__), "cookies.txt")
+        if os.path.exists(local):
+            logging.info(f"Куки YouTube загружены из файла {local}")
+            return local
+        logging.warning("YT_COOKIES не задана и cookies.txt не найден — YouTube может блокировать запросы")
+        return None
 
     # ── VK API ────────────────────────────────────────────────────────────────
 
@@ -80,7 +100,10 @@ class VKYouTubeReposter:
 
     def check_video(self, url):
         """Проверяет длину и вертикальность. Возвращает (ok, title)."""
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        opts = {"quiet": True, "no_warnings": True}
+        if self.cookies_file:
+            opts["cookiefile"] = self.cookies_file
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         duration = info.get("duration", 0)
         if duration > self.max_duration:
@@ -101,12 +124,16 @@ class VKYouTubeReposter:
     def download_video(self, url, path="temp_video.mp4"):
         opts = {
             "outtmpl": path,
-            # Берём лучший формат, где видео и аудио уже в одном файле — ffmpeg не нужен
             "format": "best[ext=mp4]/best[ext=webm]/best",
             "quiet": True,
             "no_warnings": True,
-            "socket_timeout": 30,
+            "socket_timeout": 120,
+            "retries": 10,
+            "fragment_retries": 10,
+            "http_chunk_size": 1048576,
         }
+        if self.cookies_file:
+            opts["cookiefile"] = self.cookies_file
         for attempt in range(3):
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -114,7 +141,7 @@ class VKYouTubeReposter:
                 return path
             except Exception as ex:
                 logging.warning(f"Скачивание попытка {attempt+1}: {ex}")
-                time.sleep(10)
+                time.sleep(30)
         logging.error("Не удалось скачать видео")
         return None
 
