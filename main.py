@@ -98,17 +98,26 @@ class VKYouTubeReposter:
             logging.error(f"RSS [{channel_id}]: {ex}")
             return None
 
-    def check_video(self, url):
-        """Проверяет длину и вертикальность. Возвращает (ok, title)."""
-        opts = {"quiet": True, "no_warnings": True}
+    def get_video_info(self, url):
+        """Получает метаданные без скачивания. Возвращает info dict."""
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
         if self.cookies_file:
             opts["cookiefile"] = self.cookies_file
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            return ydl.extract_info(url, download=False)
+
+    def check_video(self, url):
+        """Проверяет длину и вертикальность. Возвращает (ok, title, info)."""
+        info = self.get_video_info(url)
         duration = info.get("duration", 0)
         if duration > self.max_duration:
             logging.info(f"Слишком длинное: {duration}с > {self.max_duration}с")
-            return False, ""
+            return False, "", None
+        # Определяем размеры из formats (для Shorts width/height могут быть только там)
         w = info.get("width") or 0
         h = info.get("height") or 0
         if not (w and h):
@@ -118,19 +127,30 @@ class VKYouTubeReposter:
                     break
         if w and h and w >= h:
             logging.info(f"Не вертикальное: {w}x{h}")
-            return False, ""
-        return True, info.get("title", "Видео")
+            return False, "", None
+        return True, info.get("title", "Видео"), info
 
-    def download_video(self, url, path="temp_video.mp4"):
+    def download_video(self, url, info, path="temp_video.mp4"):
+        """Скачивает видео. info передаётся чтобы не делать повторный запрос к YT."""
+        # Выбираем лучший одиночный поток (без склейки — нет ffmpeg)
+        # Берём формат с наибольшим tbr среди тех, что содержат и видео и аудио
+        best_fmt = None
+        for fmt in sorted(info.get("formats", []), key=lambda f: f.get("tbr") or 0, reverse=True):
+            vcodec = fmt.get("vcodec", "none")
+            acodec = fmt.get("acodec", "none")
+            if vcodec != "none" and acodec != "none":
+                best_fmt = fmt["format_id"]
+                logging.info(f"Выбран формат: {fmt.get('format_id')} {fmt.get('ext')} {fmt.get('width')}x{fmt.get('height')} tbr={fmt.get('tbr')}")
+                break
+
         opts = {
             "outtmpl": path,
-            "format": "best/bestvideo*",
+            "format": best_fmt if best_fmt else "best",
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 120,
             "retries": 10,
             "fragment_retries": 10,
-            "http_chunk_size": 1048576,
         }
         if self.cookies_file:
             opts["cookiefile"] = self.cookies_file
@@ -204,10 +224,10 @@ class VKYouTubeReposter:
     def process(self, url):
         """Полный цикл: проверить → скачать → сгенерировать → залить."""
         try:
-            ok, title = self.check_video(url)
+            ok, title, info = self.check_video(url)
             if not ok:
                 return False
-            path = self.download_video(url)
+            path = self.download_video(url, info)
             if not path:
                 return False
             desc = self.generate_description(title)
