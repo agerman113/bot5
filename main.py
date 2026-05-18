@@ -103,6 +103,7 @@ class VKYouTubeReposter:
         opts = {
             "quiet": True,
             "no_warnings": True,
+            "format": "bestvideo+bestaudio/best",  # нужен для extract_info, download не происходит
         }
         if self.cookies_file:
             opts["cookiefile"] = self.cookies_file
