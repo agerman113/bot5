@@ -1,4 +1,3 @@
-vk-api
 yt-dlp
 feedparser
 openai
