@@ -1,485 +1,223 @@
-"""
-Freelance Parser Bot for VK
-Парсер заказов и упоминаний с фриланс-бирж, Telegram, VK-групп, RSS-лент
-"""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-import threading
-import time
-import logging
-import json
 import os
-from datetime import datetime
+import sys
+import time
+import gc
+import logging
+import feedparser
+import yt_dlp
+from dotenv import load_dotenv
+from openai import OpenAI, RateLimitError
+import vk_api
+import requests
 
-from parsers.freelance_ru import parse_freelance_ru
-from parsers.kwork import parse_kwork
-from parsers.fl_ru import parse_fl_ru
-from parsers.hh_ru import parse_hh_ru
-from parsers.upwork import parse_upwork
-from parsers.rss_parser import parse_rss_sources
-from parsers.telegram_parser import parse_telegram_channels
-from parsers.vk_parser import parse_vk_groups
-from data.categories import CATEGORIES_RU, CATEGORIES_EN
-from data.sources import RSS_SOURCES, TELEGRAM_CHANNELS, VK_GROUPS
+load_dotenv()
 
-# ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
 
-# ─── Config ─────────────────────────────────────────────────────────────────
-with open("config.json", encoding="utf-8") as f:
-    CONFIG = json.load(f)
+class VKYouTubeReposter:
+    def __init__(self):
+        self.vk_token = os.getenv("VK_GROUP_TOKEN")
+        self.vk_group_id = os.getenv("VK_GROUP_ID")
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        self.check_interval = int(os.getenv("CHECK_INTERVAL", 600))
+        self.channel_ids = [ch.strip() for ch in os.getenv("CHANNEL_IDS", "").split(",") if ch.strip()]
+        self.ad_text = os.getenv("AD_TEXT", "Узнай, как зарабатывать на партнёрских программах → https://vk.me/1onesis")
+        self.max_duration = int(os.getenv("MAX_DURATION_SECONDS", 60))
 
-VK_TOKEN = CONFIG["vk_token"]
-ADMIN_IDS = CONFIG.get("admin_ids", [])
-PARSE_INTERVAL = CONFIG.get("parse_interval_minutes", 30)
+        if not self.channel_ids:
+            raise ValueError("CHANNEL_IDS is empty")
 
-# ─── State storage (in-memory, persisted to JSON) ────────────────────────────
-USERS_FILE = "data/users.json"
-SEEN_FILE = "data/seen_ids.json"
+        self.vk_session = vk_api.VkApi(token=self.vk_token)
+        self.vk = self.vk_session.get_api()
 
+        self.openai_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.openrouter_api_key,
+        )
+        self.processed_videos = self.load_processed_videos()
 
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return default
+    def load_processed_videos(self):
+        if os.path.exists("processed.txt"):
+            with open("processed.txt", "r") as f:
+                return set(line.strip() for line in f)
+        return set()
 
+    def save_processed_video(self, video_id):
+        with open("processed.txt", "a") as f:
+            f.write(f"{video_id}\n")
+        self.processed_videos.add(video_id)
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    def get_latest_video_from_channel(self, channel_id):
+        try:
+            rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+            feed = feedparser.parse(rss_url)
+            if not feed.entries:
+                return None
+            latest = feed.entries[0]
+            video_id = latest.id.split(":")[-1]
+            return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "title": latest.title}
+        except Exception as e:
+            logging.error(f"RSS error: {e}")
+            return None
 
+    def is_vertical_video(self, url):
+        try:
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                duration = info.get('duration', 0)
+                if duration > self.max_duration:
+                    logging.info(f"Too long: {duration}s")
+                    return False
+                width = info.get('width')
+                height = info.get('height')
+                if width and height:
+                    return height > width
+                for f in info.get('formats', []):
+                    if f.get('width') and f.get('height'):
+                        return f['height'] > f['width']
+                return False
+        except Exception as e:
+            logging.error(f"Check error: {e}")
+            return False
 
-# user_id -> {lang: "ru"|"en", categories: [...], active: bool}
-users = load_json(USERS_FILE, {})
-# set of already-sent item IDs to avoid duplicates
-seen_ids = set(load_json(SEEN_FILE, []))
-
-
-def save_users():
-    save_json(USERS_FILE, users)
-
-
-def save_seen():
-    save_json(SEEN_FILE, list(seen_ids))
-
-
-# ─── VK API setup ────────────────────────────────────────────────────────────
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
-
-
-def send_message(user_id, text, keyboard=None):
-    """Send message to user with optional keyboard."""
-    params = {
-        "user_id": user_id,
-        "message": text,
-        "random_id": int(time.time() * 1000),
-    }
-    if keyboard:
-        params["keyboard"] = keyboard.get_keyboard()
-    try:
-        vk.messages.send(**params)
-    except Exception as e:
-        logger.error(f"send_message error to {user_id}: {e}")
-
-
-# ─── Keyboards ───────────────────────────────────────────────────────────────
-
-def kb_main_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("🇷🇺 Русские заказы", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("🇺🇸 English orders", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("📋 Мои категории", color=VkKeyboardColor.SECONDARY)
-    kb.add_button("🔔 Подписка вкл/выкл", color=VkKeyboardColor.SECONDARY)
-    kb.add_line()
-    kb.add_button("🔄 Обновить сейчас", color=VkKeyboardColor.POSITIVE)
-    kb.add_button("ℹ️ Помощь", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-
-def kb_categories_ru(selected: list):
-    kb = VkKeyboard(one_time=False)
-    cats = list(CATEGORIES_RU.items())
-    # 2 per row
-    for i, (key, label) in enumerate(cats):
-        mark = "✅ " if key in selected else ""
-        color = VkKeyboardColor.POSITIVE if key in selected else VkKeyboardColor.SECONDARY
-        kb.add_button(f"{mark}{label}", color=color)
-        if (i + 1) % 2 == 0 and i + 1 < len(cats):
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("✅ Выбрать все", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("❌ Снять все", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("◀️ Назад", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-
-def kb_categories_en(selected: list):
-    kb = VkKeyboard(one_time=False)
-    cats = list(CATEGORIES_EN.items())
-    for i, (key, label) in enumerate(cats):
-        mark = "✅ " if key in selected else ""
-        color = VkKeyboardColor.POSITIVE if key in selected else VkKeyboardColor.SECONDARY
-        kb.add_button(f"{mark}{label}", color=color)
-        if (i + 1) % 2 == 0 and i + 1 < len(cats):
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("✅ Select all", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("❌ Clear all", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("◀️ Back", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def get_user(user_id: str) -> dict:
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {
-            "lang": "ru",
-            "categories": [],
-            "active": True,
-            "menu": "main"
+    def download_video(self, url, output_path="temp_video.mp4", retries=3):
+        ydl_opts = {
+            'outtmpl': output_path,
+            'format': 'best[ext=mp4]',
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 30,
         }
-        save_users()
-    return users[uid]
-
-
-def format_item(item: dict) -> str:
-    """Format a parsed order/mention for display."""
-    lines = []
-    if item.get("source"):
-        lines.append(f"📌 {item['source']}")
-    if item.get("title"):
-        lines.append(f"📝 {item['title']}")
-    if item.get("description"):
-        desc = item["description"][:300]
-        if len(item["description"]) > 300:
-            desc += "..."
-        lines.append(f"💬 {desc}")
-    if item.get("budget"):
-        lines.append(f"💰 {item['budget']}")
-    if item.get("category"):
-        lines.append(f"🏷 {item['category']}")
-    if item.get("url"):
-        lines.append(f"🔗 {item['url']}")
-    if item.get("published"):
-        lines.append(f"🕐 {item['published']}")
-    return "\n".join(lines)
-
-
-# ─── Parsing dispatcher ──────────────────────────────────────────────────────
-
-def run_all_parsers(categories: list, lang: str = "ru") -> list:
-    """Run all parsers and return merged list of items filtered by categories."""
-    items = []
-    try:
-        if lang == "ru":
-            items += parse_fl_ru(categories)
-            items += parse_kwork(categories)
-            items += parse_freelance_ru(categories)
-            items += parse_hh_ru(categories)
-            items += parse_rss_sources(RSS_SOURCES["ru"], categories)
-            items += parse_vk_groups(VK_GROUPS, categories)
-            items += parse_telegram_channels(TELEGRAM_CHANNELS["ru"], categories)
-        else:
-            items += parse_upwork(categories)
-            items += parse_rss_sources(RSS_SOURCES["en"], categories)
-            items += parse_telegram_channels(TELEGRAM_CHANNELS["en"], categories)
-    except Exception as e:
-        logger.error(f"Parser error: {e}")
-
-    # Deduplicate by unique_id
-    new_items = []
-    for item in items:
-        uid = item.get("unique_id", "")
-        if uid and uid not in seen_ids:
-            seen_ids.add(uid)
-            new_items.append(item)
-
-    if new_items:
-        save_seen()
-    return new_items
-
-
-# ─── Background worker ───────────────────────────────────────────────────────
-
-def background_parser():
-    """Periodically parse all sources and push results to subscribed users."""
-    logger.info("Background parser started")
-    while True:
-        time.sleep(PARSE_INTERVAL * 60)
-        logger.info("Starting scheduled parse cycle")
-        for uid, udata in list(users.items()):
-            if not udata.get("active", True):
-                continue
-            cats = udata.get("categories", [])
-            if not cats:
-                continue
-            lang = udata.get("lang", "ru")
+        for attempt in range(retries):
             try:
-                items = run_all_parsers(cats, lang)
-                if items:
-                    header = "🔔 Новые заказы:" if lang == "ru" else "🔔 New orders:"
-                    send_message(int(uid), header)
-                    for item in items[:20]:  # max 20 per cycle
-                        send_message(int(uid), format_item(item))
-                        time.sleep(0.5)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                logging.info(f"Downloaded: {url}")
+                return output_path
             except Exception as e:
-                logger.error(f"Error sending to {uid}: {e}")
+                logging.warning(f"Download attempt {attempt+1} failed: {e}")
+                time.sleep(10)
+        logging.error(f"Download error after {retries} attempts")
+        return None
 
-
-# ─── Command handlers ─────────────────────────────────────────────────────────
-
-def handle_start(user_id):
-    u = get_user(user_id)
-    u["menu"] = "main"
-    save_users()
-    send_message(
-        user_id,
-        "👋 Привет! Я бот-парсер заказов с фриланс-бирж, Telegram-каналов, VK-групп и RSS.\n\n"
-        "Выбери раздел и категории — и я буду присылать тебе свежие заявки автоматически!\n\n"
-        "🇷🇺 Русские источники: fl.ru, kwork, freelance.ru, hh.ru, VK-группы, Telegram, RSS\n"
-        "🇺🇸 English sources: Upwork, Telegram EN, RSS EN",
-        kb_main_menu()
-    )
-
-
-def handle_ru_categories(user_id):
-    u = get_user(user_id)
-    u["menu"] = "cats_ru"
-    u["lang"] = "ru"
-    save_users()
-    send_message(
-        user_id,
-        "🇷🇺 Выбери категории для поиска заказов (нажимай — отмечается ✅):",
-        kb_categories_ru(u.get("categories", []))
-    )
-
-
-def handle_en_categories(user_id):
-    u = get_user(user_id)
-    u["menu"] = "cats_en"
-    u["lang"] = "en"
-    save_users()
-    send_message(
-        user_id,
-        "🇺🇸 Select categories for order search (tap to toggle ✅):",
-        kb_categories_en(u.get("categories", []))
-    )
-
-
-def handle_toggle_category(user_id, text):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-
-    # Find category key by label (strip checkmark prefix)
-    clean_text = text.replace("✅ ", "").strip()
-    matched_key = None
-    for key, label in cat_map.items():
-        if label == clean_text:
-            matched_key = key
-            break
-
-    if matched_key:
-        if matched_key in cats:
-            cats.remove(matched_key)
-        else:
-            cats.append(matched_key)
-        u["categories"] = cats
-        save_users()
-        kb = kb_categories_ru(cats) if lang == "ru" else kb_categories_en(cats)
-        chosen = [cat_map[k] for k in cats if k in cat_map]
-        msg = f"✅ Выбрано ({len(chosen)}): {', '.join(chosen) if chosen else 'ничего'}"
-        if lang == "en":
-            msg = f"✅ Selected ({len(chosen)}): {', '.join(chosen) if chosen else 'none'}"
-        send_message(user_id, msg, kb)
-
-
-def handle_select_all(user_id):
-    u = get_user(user_id)
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-    u["categories"] = list(cat_map.keys())
-    save_users()
-    kb = kb_categories_ru(u["categories"]) if lang == "ru" else kb_categories_en(u["categories"])
-    msg = "✅ Все категории выбраны!" if lang == "ru" else "✅ All categories selected!"
-    send_message(user_id, msg, kb)
-
-
-def handle_clear_all(user_id):
-    u = get_user(user_id)
-    lang = u.get("lang", "ru")
-    u["categories"] = []
-    save_users()
-    kb = kb_categories_ru([]) if lang == "ru" else kb_categories_en([])
-    msg = "❌ Все категории сняты" if lang == "ru" else "❌ All categories cleared"
-    send_message(user_id, msg, kb)
-
-
-def handle_my_categories(user_id):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    cat_map = CATEGORIES_RU if lang == "ru" else CATEGORIES_EN
-    labels = [cat_map.get(k, k) for k in cats]
-    if labels:
-        msg = "📋 Твои категории:\n• " + "\n• ".join(labels)
-    else:
-        msg = "📋 Категории не выбраны. Нажми 🇷🇺 или 🇺🇸 для выбора."
-    send_message(user_id, msg, kb_main_menu())
-
-
-def handle_toggle_subscription(user_id):
-    u = get_user(user_id)
-    u["active"] = not u.get("active", True)
-    save_users()
-    if u["active"]:
-        send_message(user_id, "🔔 Автоуведомления включены!", kb_main_menu())
-    else:
-        send_message(user_id, "🔕 Автоуведомления отключены.", kb_main_menu())
-
-
-def handle_fetch_now(user_id):
-    u = get_user(user_id)
-    cats = u.get("categories", [])
-    lang = u.get("lang", "ru")
-    if not cats:
-        msg = "⚠️ Сначала выбери категории!" if lang == "ru" else "⚠️ Please select categories first!"
-        send_message(user_id, msg, kb_main_menu())
-        return
-
-    msg = "🔄 Ищу заказы, подожди..." if lang == "ru" else "🔄 Fetching orders, please wait..."
-    send_message(user_id, msg)
-
-    def fetch_and_send():
-        items = run_all_parsers(cats, lang)
-        if items:
-            header = f"🎯 Найдено {len(items)} заказов:" if lang == "ru" else f"🎯 Found {len(items)} orders:"
-            send_message(user_id, header)
-            for item in items[:15]:
-                send_message(user_id, format_item(item))
-                time.sleep(0.4)
-        else:
-            msg2 = "😔 Новых заказов пока нет. Попробуй позже." if lang == "ru" else "😔 No new orders found. Try later."
-            send_message(user_id, msg2, kb_main_menu())
-
-    threading.Thread(target=fetch_and_send, daemon=True).start()
-
-
-def handle_help(user_id):
-    send_message(
-        user_id,
-        "ℹ️ Как пользоваться ботом:\n\n"
-        "1️⃣ Нажми 🇷🇺 или 🇺🇸 для выбора языка заказов\n"
-        "2️⃣ Выбери интересующие категории (можно несколько)\n"
-        "3️⃣ Нажми 🔄 Обновить сейчас — получишь свежие заказы\n"
-        "4️⃣ Включи 🔔 Подписку — бот будет присылать заказы автоматически\n\n"
-        f"🕐 Автообновление каждые {PARSE_INTERVAL} мин.\n\n"
-        "📦 Источники RU: fl.ru, kwork.ru, freelance.ru, hh.ru, VK-группы, Telegram-каналы, RSS\n"
-        "📦 Источники EN: Upwork, Telegram EN, RSS EN",
-        kb_main_menu()
-    )
-
-
-# ─── Main message router ─────────────────────────────────────────────────────
-
-def route_message(user_id, text: str):
-    u = get_user(user_id)
-    menu = u.get("menu", "main")
-    lang = u.get("lang", "ru")
-
-    # Universal commands
-    if text in ["/start", "start", "начать", "старт"]:
-        handle_start(user_id)
-        return
-
-    if "🇷🇺" in text or "русские" in text.lower():
-        handle_ru_categories(user_id)
-        return
-
-    if "🇺🇸" in text or "english" in text.lower():
-        handle_en_categories(user_id)
-        return
-
-    if "мои категории" in text.lower() or "my categories" in text.lower() or "📋" in text:
-        handle_my_categories(user_id)
-        return
-
-    if "подписка" in text.lower() or "subscription" in text.lower() or "🔔" in text:
-        handle_toggle_subscription(user_id)
-        return
-
-    if "обновить" in text.lower() or "update" in text.lower() or "fetch" in text.lower() or "🔄" in text:
-        handle_fetch_now(user_id)
-        return
-
-    if "помощь" in text.lower() or "help" in text.lower() or "ℹ️" in text:
-        handle_help(user_id)
-        return
-
-    if "◀️" in text or "назад" in text.lower() or "back" in text.lower():
-        u["menu"] = "main"
-        save_users()
-        send_message(user_id, "Главное меню:", kb_main_menu())
-        return
-
-    if "выбрать все" in text.lower() or "select all" in text.lower() or "✅ выбр" in text.lower() or "✅ select" in text.lower():
-        handle_select_all(user_id)
-        return
-
-    if "снять все" in text.lower() or "clear all" in text.lower() or "❌" in text:
-        handle_clear_all(user_id)
-        return
-
-    # Category toggle
-    if menu in ("cats_ru", "cats_en"):
-        handle_toggle_category(user_id, text)
-        return
-
-    # Default
-    send_message(user_id, "Используй кнопки меню 👇", kb_main_menu())
-
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
-def main():
-    logger.info("Bot starting...")
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("data", exist_ok=True)
-
-    # Start background parser thread
-    parser_thread = threading.Thread(target=background_parser, daemon=True)
-    parser_thread.start()
-
-    logger.info("Listening for messages...")
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_id = event.user_id
-            text = (event.text or "").strip()
-            logger.info(f"Message from {user_id}: {text!r}")
+    def generate_description(self, video_title, video_url):
+        prompt = f"""
+        Напиши короткое привлекательное описание для смешного вертикального видео (YouTube Shorts) для VK.
+        Название: "{video_title}"
+        Требования: русский язык, 2-3 предложения, 3-5 хэштегов (#юмор #shorts), эмодзи.
+        Не упоминай рекламу.
+        """
+        for attempt in range(3):
             try:
-                route_message(user_id, text)
-            except Exception as e:
-                logger.error(f"Handler error: {e}")
+                response = self.openai_client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=200,
+                )
+                ai_text = response.choices[0].message.content
+                if ai_text is None or not ai_text.strip():
+                    raise ValueError("Empty AI response")
+                ai_text = ai_text.strip()
+                return f"{ai_text}\n\n{self.ad_text}"
+            except (RateLimitError, Exception) as e:
+                logging.warning(f"AI attempt {attempt+1} failed: {e}")
+                time.sleep(10 * (attempt + 1))
+        return f"😄 Смешное видео: {video_title}\n\n#юмор #shorts\n\n{self.ad_text}"
 
+    def post_to_vk(self, video_path, description):
+        try:
+            # 1. Получаем URL для загрузки через метод video.save (работает с сервисным ключом)
+            save_data = self.vk.video.save(
+                name=os.path.basename(video_path),
+                description=description,
+                group_id=int(self.vk_group_id),
+                is_private=0,
+                wallpost=1
+            )
+            upload_url = save_data['upload_url']
+            video_id = save_data['video_id']
+            owner_id = save_data['owner_id']
+
+            # 2. Загружаем файл
+            with open(video_path, 'rb') as f:
+                files = {'video_file': f}
+                response = requests.post(upload_url, files=files, timeout=60)
+            if response.status_code != 200:
+                raise Exception(f"Upload failed with status {response.status_code}")
+
+            video_url = f"https://vk.com/video{owner_id}_{video_id}"
+            logging.info(f"Published: {video_url}")
+            return True
+        except Exception as e:
+            logging.error(f"VK upload error: {e}")
+            return False
+
+    def process_new_video(self, channel_id, video_info):
+        logging.info(f"New video: {video_info['title']} ({video_info['url']})")
+        if not self.is_vertical_video(video_info["url"]):
+            logging.info("Not vertical or too long, skip")
+            self.save_processed_video(video_info["id"])
+            return False
+
+        video_file = self.download_video(video_info["url"])
+        if not video_file:
+            return False
+
+        gc.collect()
+        time.sleep(1)
+        description = self.generate_description(video_info["title"], video_info["url"])
+        success = self.post_to_vk(video_file, description)
+        if os.path.exists(video_file):
+            os.remove(video_file)
+        gc.collect()
+
+        if success:
+            self.save_processed_video(video_info["id"])
+            logging.info("Successfully published")
+        return success
+
+    def run(self):
+        logging.info(f"Bot started. Channels: {', '.join(self.channel_ids)}")
+        while True:
+            try:
+                for ch in self.channel_ids:
+                    latest = self.get_latest_video_from_channel(ch)
+                    if latest and latest["id"] not in self.processed_videos:
+                        self.process_new_video(ch, latest)
+                time.sleep(self.check_interval)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logging.error(f"Main loop error: {e}")
+                time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test-url":
+        test_url = sys.argv[2]
+        logging.info(f"TEST MODE: {test_url}")
+        bot = VKYouTubeReposter()
+        if bot.is_vertical_video(test_url):
+            logging.info("Video is vertical and short. Downloading...")
+            video_file = bot.download_video(test_url)
+            if video_file:
+                desc = bot.generate_description("Test video", test_url)
+                bot.post_to_vk(video_file, desc)
+                os.remove(video_file)
+                logging.info("Test finished")
+            else:
+                logging.error("Download failed")
+        else:
+            logging.info("Not vertical or too long")
+        sys.exit(0)
+    bot = VKYouTubeReposter()
+    bot.run()
