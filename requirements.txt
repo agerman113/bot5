@@ -1,5 +1,6 @@
-vk_api==11.9.9
-requests==2.31.0
-feedparser==6.0.11
-beautifulsoup4==4.12.3
-lxml==5.1.0
+vk-api
+yt-dlp
+feedparser
+openai
+python-dotenv
+requests
