@@ -26,7 +26,7 @@ class VKYouTubeReposter:
         self.vk_token = os.getenv("VK_GROUP_TOKEN")
         self.vk_group_id = os.getenv("VK_GROUP_ID")
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        self.model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
         self.check_interval = int(os.getenv("CHECK_INTERVAL", 600))
         self.channel_ids = [ch.strip() for ch in os.getenv("CHANNEL_IDS", "").split(",") if ch.strip()]
         self.ad_text = os.getenv("AD_TEXT", "Узнай, как зарабатывать на партнёрских программах → https://vk.me/1onesis")
@@ -136,7 +136,6 @@ class VKYouTubeReposter:
 
     def post_to_vk(self, video_path, description):
         try:
-            # 1. Получаем URL для загрузки через метод video.save (работает с сервисным ключом)
             save_data = self.vk.video.save(
                 name=os.path.basename(video_path),
                 description=description,
@@ -148,7 +147,6 @@ class VKYouTubeReposter:
             video_id = save_data['video_id']
             owner_id = save_data['owner_id']
 
-            # 2. Загружаем файл
             with open(video_path, 'rb') as f:
                 files = {'video_file': f}
                 response = requests.post(upload_url, files=files, timeout=60)
