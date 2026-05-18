@@ -101,8 +101,8 @@ class VKYouTubeReposter:
     def download_video(self, url, path="temp_video.mp4"):
         opts = {
             "outtmpl": path,
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
+            # Берём лучший формат, где видео и аудио уже в одном файле — ffmpeg не нужен
+            "format": "best[ext=mp4]/best[ext=webm]/best",
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": 30,
