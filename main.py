@@ -4,14 +4,12 @@
 import os
 import sys
 import time
-import gc
 import logging
 import feedparser
 import yt_dlp
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
-import vk_api
-import requests
 
 load_dotenv()
 
@@ -21,195 +19,219 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 
+
 class VKYouTubeReposter:
     def __init__(self):
-        self.vk_token = os.getenv("VK_GROUP_TOKEN")
-        self.vk_group_id = os.getenv("VK_GROUP_ID")
-        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
-        self.model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        # Сервисный ключ приоритетнее токена группы
+        self.vk_token    = os.getenv("VK_SERVICE_KEY") or os.getenv("VK_GROUP_TOKEN")
+        self.vk_group_id = int(os.getenv("VK_GROUP_ID"))
+        self.model          = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
         self.check_interval = int(os.getenv("CHECK_INTERVAL", 600))
-        self.channel_ids = [ch.strip() for ch in os.getenv("CHANNEL_IDS", "").split(",") if ch.strip()]
-        self.ad_text = os.getenv("AD_TEXT", "Узнай, как зарабатывать на партнёрских программах → https://vk.me/1onesis")
-        self.max_duration = int(os.getenv("MAX_DURATION_SECONDS", 60))
+        self.channel_ids    = [c.strip() for c in os.getenv("CHANNEL_IDS", "").split(",") if c.strip()]
+        self.ad_text        = os.getenv("AD_TEXT", "")
+        self.max_duration   = int(os.getenv("MAX_DURATION_SECONDS", 180))
 
-        if not self.channel_ids:
-            logging.warning("CHANNEL_IDS не заданы. Бот будет работать только в ручном режиме (через FORCE_UPLOAD_URL)")
+        if not self.vk_token:
+            raise ValueError("Нужен VK_SERVICE_KEY или VK_GROUP_TOKEN в .env")
 
-        self.vk_session = vk_api.VkApi(token=self.vk_token)
-        self.vk = self.vk_session.get_api()
-        self.openai_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=self.openrouter_api_key)
-        self.processed_videos = self.load_processed_videos()
+        self.ai = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY")
+        )
+        self.processed = self._load_processed()
 
-    def load_processed_videos(self):
+    # ── VK API ────────────────────────────────────────────────────────────────
+
+    def _vk(self, method, params):
+        params.update({"access_token": self.vk_token, "v": "5.199"})
+        r = requests.post(f"https://api.vk.com/method/{method}", data=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise Exception(f"VK {data['error']['error_code']}: {data['error']['error_msg']}")
+        return data["response"]
+
+    # ── Processed list ────────────────────────────────────────────────────────
+
+    def _load_processed(self):
         if os.path.exists("processed.txt"):
-            with open("processed.txt", "r") as f:
-                return set(line.strip() for line in f)
+            with open("processed.txt") as f:
+                return set(l.strip() for l in f if l.strip())
         return set()
 
-    def save_processed_video(self, video_id):
+    def _mark_processed(self, video_id):
         with open("processed.txt", "a") as f:
             f.write(f"{video_id}\n")
-        self.processed_videos.add(video_id)
+        self.processed.add(video_id)
 
-    def get_latest_video_from_channel(self, channel_id):
+    # ── YouTube ───────────────────────────────────────────────────────────────
+
+    def get_latest_video(self, channel_id):
         try:
-            rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-            feed = feedparser.parse(rss_url)
+            feed = feedparser.parse(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}")
             if not feed.entries:
                 return None
-            latest = feed.entries[0]
-            video_id = latest.id.split(":")[-1]
-            return {"id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}", "title": latest.title}
-        except Exception as e:
-            logging.error(f"RSS error: {e}")
+            e = feed.entries[0]
+            vid = e.id.split(":")[-1]
+            return {"id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "title": e.title}
+        except Exception as ex:
+            logging.error(f"RSS [{channel_id}]: {ex}")
             return None
 
-    def is_vertical_video(self, url):
-        try:
-            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                duration = info.get('duration', 0)
-                if duration > self.max_duration:
-                    logging.info(f"Too long: {duration}s")
-                    return False
-                width = info.get('width')
-                height = info.get('height')
-                if width and height:
-                    return height > width
-                for f in info.get('formats', []):
-                    if f.get('width') and f.get('height'):
-                        return f['height'] > f['width']
-                return False
-        except Exception as e:
-            logging.error(f"Check error: {e}")
-            return False
+    def check_video(self, url):
+        """Проверяет длину и вертикальность. Возвращает (ok, title)."""
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        duration = info.get("duration", 0)
+        if duration > self.max_duration:
+            logging.info(f"Слишком длинное: {duration}с > {self.max_duration}с")
+            return False, ""
+        w = info.get("width") or 0
+        h = info.get("height") or 0
+        if not (w and h):
+            for fmt in info.get("formats", []):
+                if fmt.get("width") and fmt.get("height"):
+                    w, h = fmt["width"], fmt["height"]
+                    break
+        if w and h and w >= h:
+            logging.info(f"Не вертикальное: {w}x{h}")
+            return False, ""
+        return True, info.get("title", "Видео")
 
-    def download_video(self, url, output_path="temp_video.mp4", retries=3):
-        ydl_opts = {
-            'outtmpl': output_path,
-            'format': 'best[ext=mp4]',
-            'quiet': True,
-            'no_warnings': True,
-            'socket_timeout': 30,
+    def download_video(self, url, path="temp_video.mp4"):
+        opts = {
+            "outtmpl": path,
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
         }
-        for attempt in range(retries):
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                logging.info(f"Downloaded: {url}")
-                return output_path
-            except Exception as e:
-                logging.warning(f"Download attempt {attempt+1} failed: {e}")
-                time.sleep(10)
-        logging.error(f"Download error after {retries} attempts")
-        return None
-
-    def generate_description(self, video_title, video_url):
-        prompt = f"""
-        Напиши короткое привлекательное описание для смешного вертикального видео для VK.
-        Название: "{video_title}"
-        Требования: русский язык, 2-3 предложения, 3-5 хэштегов (#юмор #shorts), эмодзи.
-        """
         for attempt in range(3):
             try:
-                response = self.openai_client.chat.completions.create(
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                return path
+            except Exception as ex:
+                logging.warning(f"Скачивание попытка {attempt+1}: {ex}")
+                time.sleep(10)
+        logging.error("Не удалось скачать видео")
+        return None
+
+    # ── AI description ────────────────────────────────────────────────────────
+
+    def generate_description(self, title):
+        prompt = (
+            f'Напиши короткое привлекательное описание для смешного вертикального видео для VK.\n'
+            f'Название: "{title}"\n'
+            f'Требования: русский язык, 2-3 предложения, 3-5 хэштегов (#юмор #shorts), эмодзи.'
+        )
+        for attempt in range(3):
+            try:
+                resp = self.ai.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.7,
                     max_tokens=200,
                 )
-                ai_text = response.choices[0].message.content
-                if ai_text is None or not ai_text.strip():
-                    raise ValueError("Empty AI response")
-                ai_text = ai_text.strip()
-                return f"{ai_text}\n\n{self.ad_text}"
-            except (RateLimitError, Exception) as e:
-                logging.warning(f"AI attempt {attempt+1} failed: {e}")
+                text = (resp.choices[0].message.content or "").strip()
+                if text:
+                    return f"{text}\n\n{self.ad_text}".strip()
+            except (RateLimitError, Exception) as ex:
+                logging.warning(f"AI попытка {attempt+1}: {ex}")
                 time.sleep(10 * (attempt + 1))
-        return f"😄 Смешное видео: {video_title}\n\n#юмор #shorts\n\n{self.ad_text}"
+        return f"😄 {title}\n\n#юмор #shorts\n\n{self.ad_text}".strip()
 
-    def post_to_vk(self, video_path, description):
+    # ── VK publish ────────────────────────────────────────────────────────────
+
+    def post_to_vk(self, video_path, title, description):
+        # 1. Получаем upload_url
+        save = self._vk("video.save", {
+            "name": title[:128],
+            "description": description[:5000],
+            "group_id": self.vk_group_id,
+            "is_private": 0,
+            "wallpost": 0,
+        })
+        upload_url = save["upload_url"]
+        video_id   = save["video_id"]
+        owner_id   = save["owner_id"]
+
+        # 2. Загружаем файл
+        with open(video_path, "rb") as fh:
+            resp = requests.post(upload_url, files={"video_file": fh}, timeout=120)
+        resp.raise_for_status()
+
+        # 3. Публикуем на стену
+        self._vk("wall.post", {
+            "owner_id": -self.vk_group_id,
+            "from_group": 1,
+            "message": description,
+            "attachments": f"video{owner_id}_{video_id}",
+        })
+        logging.info(f"Опубликовано: https://vk.com/video{owner_id}_{video_id}")
+        return True
+
+    # ── Main actions ──────────────────────────────────────────────────────────
+
+    def process(self, url):
+        """Полный цикл: проверить → скачать → сгенерировать → залить."""
         try:
-            save_data = self.vk.video.save(
-                name=os.path.basename(video_path),
-                description=description,
-                group_id=int(self.vk_group_id),
-                is_private=0,
-                wallpost=1
-            )
-            upload_url = save_data['upload_url']
-            video_id = save_data['video_id']
-            owner_id = save_data['owner_id']
-            with open(video_path, 'rb') as f:
-                files = {'video_file': f}
-                response = requests.post(upload_url, files=files, timeout=60)
-            if response.status_code != 200:
-                raise Exception(f"Upload failed: {response.status_code}")
-            video_url = f"https://vk.com/video{owner_id}_{video_id}"
-            logging.info(f"Published: {video_url}")
-            return True
-        except Exception as e:
-            logging.error(f"VK upload error: {e}")
+            ok, title = self.check_video(url)
+            if not ok:
+                return False
+            path = self.download_video(url)
+            if not path:
+                return False
+            desc = self.generate_description(title)
+            return self.post_to_vk(path, title, desc)
+        except Exception as ex:
+            logging.error(f"Ошибка обработки {url}: {ex}")
             return False
-
-    def upload_by_url(self, url):
-        """Принудительная заливка по ссылке (ручной режим)"""
-        logging.info(f"Ручной режим: заливка {url}")
-        if not self.is_vertical_video(url):
-            logging.error("Видео не вертикальное или слишком длинное — отказ")
-            return False
-        video_file = self.download_video(url)
-        if not video_file:
-            return False
-        desc = self.generate_description("видео по запросу", url)
-        success = self.post_to_vk(video_file, desc)
-        if os.path.exists(video_file):
-            os.remove(video_file)
-        return success
+        finally:
+            if os.path.exists("temp_video.mp4"):
+                os.remove("temp_video.mp4")
 
     def run_forever(self):
-        """Автоматический режим: мониторинг каналов"""
-        logging.info(f"Автоматический режим. Каналы: {', '.join(self.channel_ids)}")
+        if not self.channel_ids:
+            logging.warning("CHANNEL_IDS не заданы — мониторинг отключён")
+            return
+        logging.info(f"Мониторинг каналов: {', '.join(self.channel_ids)}")
         while True:
             try:
                 for ch in self.channel_ids:
-                    latest = self.get_latest_video_from_channel(ch)
-                    if latest and latest["id"] not in self.processed_videos:
-                        logging.info(f"Новое видео: {latest['title']} ({latest['url']})")
-                        if self.is_vertical_video(latest["url"]):
-                            video_file = self.download_video(latest["url"])
-                            if video_file:
-                                desc = self.generate_description(latest["title"], latest["url"])
-                                if self.post_to_vk(video_file, desc):
-                                    self.save_processed_video(latest["id"])
-                                os.remove(video_file)
-                        else:
-                            logging.info("Не вертикальное или слишком длинное, пропускаем")
-                            self.save_processed_video(latest["id"])
+                    vid = self.get_latest_video(ch)
+                    if not vid or vid["id"] in self.processed:
+                        continue
+                    logging.info(f"Новое видео: {vid['title']}")
+                    self.process(vid["url"])
+                    self._mark_processed(vid["id"])
                 time.sleep(self.check_interval)
             except KeyboardInterrupt:
+                logging.info("Остановка")
                 break
-            except Exception as e:
-                logging.error(f"Ошибка в цикле: {e}")
+            except Exception as ex:
+                logging.error(f"Ошибка цикла: {ex}")
                 time.sleep(60)
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     bot = VKYouTubeReposter()
 
-    # ПРИОРИТЕТ: если задана переменная FORCE_UPLOAD_URL — заливаем и выходим
+    # Режим 1: FORCE_UPLOAD_URL в .env → залить и выйти
     force_url = os.getenv("FORCE_UPLOAD_URL", "").strip()
     if force_url:
-        logging.info("=== РЕЖИМ ПРИНУДИТЕЛЬНОЙ ЗАЛИВКИ ===")
-        success = bot.upload_by_url(force_url)
-        sys.exit(0 if success else 1)
+        logging.info(f"=== РУЧНАЯ ЗАЛИВКА: {force_url} ===")
+        ok = bot.process(force_url)
+        sys.exit(0 if ok else 1)
 
-    # Если передан аргумент командной строки --test-url (для локальных тестов)
-    if len(sys.argv) >= 3 and sys.argv[1] == "--test-url":
-        test_url = sys.argv[2]
-        logging.info(f"=== ТЕСТОВЫЙ РЕЖИМ (аргумент) ===")
-        bot.upload_by_url(test_url)
-        sys.exit(0)
+    # Режим 2: аргумент командной строки → python main.py https://...
+    if len(sys.argv) == 2 and sys.argv[1].startswith("http"):
+        logging.info(f"=== РУЧНАЯ ЗАЛИВКА (аргумент): {sys.argv[1]} ===")
+        ok = bot.process(sys.argv[1])
+        sys.exit(0 if ok else 1)
 
-    # Иначе — автоматический режим
+    # Режим 3: автоматический мониторинг каналов
     bot.run_forever()
